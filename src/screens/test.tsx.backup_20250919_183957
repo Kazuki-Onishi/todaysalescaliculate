@@ -1,0 +1,598 @@
+﻿// src/screens/test.tsx
+import React, { useMemo, useState } from 'react';
+import {
+  Alert,
+  Platform,
+  Pressable,
+  ScrollView,
+  StyleSheet,
+  Text,
+  View,
+  Share,
+} from 'react-native';
+
+import DocumentPicker, { types as DocTypes } from 'react-native-document-picker';
+import RNFS from 'react-native-fs';
+import BlobUtil from 'react-native-blob-util';
+import Clipboard from '@react-native-clipboard/clipboard';
+import Papa from 'papaparse';
+
+type ProductRow = Record<string, any>;
+type StatsRow = Record<string, any>;
+
+const RAMEN_KEYS = ['花', '月', '雪', '月花', '雪月', '雪月花', '花こふれ', 'カレーラーメン', '氷花'] as const;
+type RamenKey = typeof RAMEN_KEYS[number];
+const RAMEN_LABELS: Record<RamenKey, string> = {
+  '花': '花',
+  '月': '月（ランチ）',
+  '雪': '雪（ランチ）',
+  '月花': '月花',
+  '雪月': '雪月',
+  '雪月花': '雪月花',
+  '花こふれ': '花こふれ',
+  'カレーラーメン': 'カレーラーメン',
+  '氷花': '氷花',
+};
+const RAMEN_DISPLAY_ORDER: RamenKey[] = ['雪', '月', '花', '月花', '雪月', '雪月花', '花こふれ', 'カレーラーメン', '氷花'];
+const SET_ALLOWED_KEYS: ReadonlyArray<RamenKey> = ['花', '月花', '雪月'];
+type Totals = Record<RamenKey, number>;
+type SetTotals = Record<RamenKey, number>;
+
+type PickedFile = { uri: string; name?: string };
+
+const norm = (s: string) => String(s ?? '').trim().toLowerCase();
+const toNum = (v: any): number => {
+  if (v == null) return 0;
+  if (typeof v === 'number') return v;
+  const s = String(v).replace(/[\,\s]/g, '');
+  const m = s.match(/-?\d+(\.\d+)?/);
+  return m ? Number(m[0]) : 0;
+};
+const firstByCandidates = (row: Record<string, any>, candidates: string[]) => {
+  const keys = Object.keys(row);
+  for (const cand of candidates) {
+    const hit = keys.find(k => norm(k) === norm(cand));
+    if (hit) return toNum(row[hit]);
+  }
+  return 0;
+};
+const firstKeyStr = (row: Record<string, any>, candidates: string[]) => {
+  const keys = Object.keys(row);
+  for (const cand of candidates) {
+    const hit = keys.find(k => norm(k) === norm(cand));
+    if (hit) return String(row[hit] ?? '');
+  }
+  return '';
+};
+
+const PRODUCT_NAME_CANDS = ['商品名','品名','メニュー','商品','Item Name','item','name'];
+const PRODUCT_QTY_CANDS  = ['商品販売数','販売数','数量','個数','Quantity','Qty'];
+const PAYMENT_KEY_ORDER = ['total','card','tablecheck','paypay','cash','funfo'] as const;
+type PaymentKey = typeof PAYMENT_KEY_ORDER[number];
+
+const PAYMENT_LABELS: Record<PaymentKey, string> = {
+  total: '売上',
+  card: 'クレジット・IC（Square）',
+  tablecheck: 'Table check',
+  paypay: 'PayPay',
+  cash: '現金',
+  funfo: 'Funfo',
+};
+
+const PAYMENT_ALIASES: Record<PaymentKey, string[]> = {
+  total: ['売上高（税込み）','売上高 (税込み)','売上高 (税込)','税込み売上高','税込売上','割引前 売上高','売上高（税抜き）','売上高（非課税）'],
+  card: ['Square','square','クレジット・IC','クレジット・IC（Square）','クレジット･IC'],
+  tablecheck: ['Table check','TableCheck','テーブルチェック'],
+  paypay: ['PayPay','paypay','Pay Pay'],
+  cash: ['現金','cash','Cash','CASH'],
+  funfo: ['Funfo','fnfo','FNFO','Fnfo'],
+};
+
+const EXTRA_PAYMENT_IGNORE = ['会計数','組数','groups','group count','客数','来客数','人数','customers'];
+const PRODUCT_CATEGORY_CANDS = ['カテゴリ','カテゴリー','category','Category'];
+
+const jpCurrency = (n: number) => '￥' + n.toLocaleString('ja-JP');
+const jpDateLabel = (isoDate: string) => {
+  const d = new Date(isoDate + 'T00:00:00+09:00');
+  const w = ['日曜日','月曜日','火曜日','水曜日','木曜日','金曜日','土曜日'][d.getDay()];
+  return `${d.getMonth()+1}月${d.getDate()}日（${w}）`;
+};
+
+// ramen detection
+const isRamenish = (name: string) => /ラーメン|らーめん|麺|ramen/i.test(name);
+const isYokubariCurry = (name: string) => /よくばり.*カレー/i.test(name);
+const isPattyCurry = (name: string) => /(パティ|ﾊﾟﾃｨ).*(カレー|ｶﾚｰ)/i.test(name);
+const guessRamenKey = (raw: string): RamenKey | undefined => {
+  const name = String(raw);
+  if (/雪月花|setsugekka/i.test(name)) return '雪月花';
+  if (/雪月|setsugetsu/i.test(name)) return '雪月';
+  if (/月花|gekka/i.test(name)) return '月花';
+  if (/氷花|hyouka|hyoka|ice\s*hana/i.test(name)) return '氷花';
+  if (/花こふれ|hana\s*cof+ret|hana\s*coffret/i.test(name)) return '花こふれ';
+  if (/(?:カレー|curry).*(?:ラーメン|らーめん|ramen)/i.test(name)) return 'カレーラーメン';
+  if (/豆乳ラーメン「?花|(?:^|\s)花(?:」|$)|\bhana\b/i.test(name)) return '花';
+  if (/(?:「|^|\s)月(?:」|$)|\btsuki\b/i.test(name)) return '月';
+  if (/(?:「|^|\s)雪(?:」|$)|\byuki\b/i.test(name)) return '雪';
+  if (/平日ランチ限定/.test(name)) return undefined;
+  if (/(セット|コース|set\\b|course\\b)/i.test(name) && isRamenish(name)) return undefined;
+  if (isRamenish(name)) return undefined;
+  return undefined;
+};
+
+const makeEmptyTotals = (): Totals => ({ 花:0, 月:0, 雪:0, 月花:0, 雪月:0, 雪月花:0, 花こふれ:0, カレーラーメン:0, 氷花:0 });
+const makeEmptySetTotals = (): SetTotals => ({ 花:0, 月:0, 雪:0, 月花:0, 雪月:0, 雪月花:0, 花こふれ:0, カレーラーメン:0, 氷花:0 });
+
+const renderOutput = (
+  meta: {
+    dateISO: string;
+    total: number;
+    cash: number;
+    card: number;  // Square only
+    paypay: number;
+    funfo: number;
+    customers: number;
+    yokubariCurry: number;
+    pattyCurry: number;
+    otherPayments: { label: string; amount: number }[];
+  },
+  ramenTotals: Totals,
+  ramenSetTotals: SetTotals,
+  unassignedCount: number
+) => {
+  const ramenTotalCount = RAMEN_KEYS.reduce((s, k) => s + ramenTotals[k] + ramenSetTotals[k], 0);
+  const lines: string[] = [];
+  const pushBlank = () => {
+    if (lines.length === 0 || lines[lines.length - 1] !== '') {
+      lines.push('');
+    }
+  };
+
+  lines.push(jpDateLabel(meta.dateISO));
+  pushBlank();
+  lines.push(`売上　${jpCurrency(meta.total)}`);
+
+  const paymentEntries: { label: string; amount: number }[] = [
+    { label: '����', amount: meta.cash },
+    { label: '�N���W�b�g�EIC', amount: meta.card },
+    { label: 'PayPay', amount: meta.paypay },
+    { label: 'Funfo', amount: meta.funfo },
+    ...meta.otherPayments,
+  ];
+
+  const paymentTotals: Record<string, number> = {};
+  const paymentOrder: string[] = [];
+  paymentEntries.forEach(({ label, amount }) => {
+    if (!amount || amount <= 0) return;
+    const hasCash = norm(label).includes('cash');
+    const finalLabel = hasCash ? '����' : String(label);
+    if (!(finalLabel in paymentTotals)) {
+      paymentTotals[finalLabel] = 0;
+      paymentOrder.push(finalLabel);
+    }
+    paymentTotals[finalLabel] += amount;
+  });
+
+  paymentOrder.forEach(label => {
+    const amount = paymentTotals[label];
+    if (amount > 0) {
+      lines.push(label + '�@' + jpCurrency(amount));
+    }
+  });
+
+  const ramenLines: string[] = [];
+  RAMEN_DISPLAY_ORDER.forEach(k => {
+    const base = ramenTotals[k];
+    const set = ramenSetTotals[k];
+    if (!base && !set) return;
+    const setNote = set ? `(＋セット${set}杯)` : '';
+    ramenLines.push(`・${RAMEN_LABELS[k]}　${base}杯${setNote}`);
+  });
+
+  if (ramenLines.length) {
+    pushBlank();
+    if (ramenTotalCount > 0) {
+      lines.push(`ラーメンtotal   ${ramenTotalCount}杯`);
+    }
+    lines.push(...ramenLines);
+  }
+
+  const sideLines: string[] = [];
+  if (meta.yokubariCurry > 0) {
+    sideLines.push(`・よくばりカレー　${meta.yokubariCurry}皿`);
+  }
+  if (meta.pattyCurry > 0) {
+    sideLines.push(`・パティカレー　${meta.pattyCurry}皿`);
+  }
+  if (sideLines.length) {
+    pushBlank();
+    lines.push(...sideLines);
+  }
+
+  if (unassignedCount > 0) {
+    pushBlank();
+    lines.push(`（要振り分け候補：未計上 ${unassignedCount} 件）`);
+  }
+
+  return lines.join('\n');
+};
+
+// ===== ファイル選択 & 読込（非-Expo） =====
+async function pickOne(_kind: 'product'|'stats'): Promise<PickedFile|null> {
+  try {
+    const res = await DocumentPicker.pickSingle({
+      type: [DocTypes.csv, DocTypes.plainText, 'text/comma-separated-values', 'application/vnd.ms-excel'],
+      copyTo: 'cachesDirectory', // fileCopyUri を得る
+      presentationStyle: 'fullScreen',
+    });
+    const uri = res.fileCopyUri || res.uri;
+    return { uri, name: res.name || (res as any).fileName || 'selected.csv' };
+  } catch (e: any) {
+    if (DocumentPicker.isCancel(e)) return null;
+    console.error(e);
+    Alert.alert('選択エラー', e?.message ?? String(e));
+    return null;
+  }
+}
+
+async function readText(uri: string): Promise<string> {
+  if (Platform.OS === 'web') {
+    const r = await fetch(uri);
+    if (!r.ok) throw new Error('CSVの読み込みに失敗（web）');
+    return await r.text();
+  }
+  // Android の content:// は BlobUtil で読む
+  if (uri.startsWith('content://')) {
+    return await BlobUtil.fs.readFile(uri, 'utf8');
+  }
+  // file:// or absolute path
+  const path = uri.startsWith('file://') ? uri.replace('file://','') : uri;
+  return await RNFS.readFile(path, 'utf8');
+}
+
+export default function TestPageScreen() {
+  const [productFile, setProductFile] = useState<PickedFile|null>(null);
+  const [statsFile, setStatsFile] = useState<PickedFile|null>(null);
+  const [unassigned, setUnassigned] = useState<{ name: string; count: number; isSet: boolean }[]>([]);
+  const [ramenTotals, setRamenTotals] = useState<Totals>(makeEmptyTotals());
+  const [ramenSetTotals, setRamenSetTotals] = useState<SetTotals>(makeEmptySetTotals());
+  const [meta, setMeta] = useState({
+    dateISO: new Date().toISOString().slice(0,10),
+    total: 0, cash: 0, card: 0, paypay: 0, funfo: 0, customers: 0,
+    yokubariCurry: 0, pattyCurry: 0,
+    otherPayments: [] as { label: string; amount: number }[],
+  });
+
+  const output = useMemo(
+    () => renderOutput(meta, ramenTotals, ramenSetTotals, unassigned.length),
+    [meta, ramenTotals, ramenSetTotals, unassigned.length]
+  );
+
+  const onPick = async (kind: 'product'|'stats') => {
+    const picked = await pickOne(kind);
+    if (!picked) return;
+    if (kind === 'product') setProductFile(picked);
+    else setStatsFile(picked);
+  };
+
+  const parseCsv = (text: string) => {
+    const { data } = Papa.parse(text, { header: true, skipEmptyLines: true });
+    return data as any[];
+  };
+
+  const makeSummary = async () => {
+    try {
+      if (!productFile || !statsFile) {
+        Alert.alert('不足', '「商品別CSV」と「支払方法別CSV」を両方選んでください。');
+        return;
+      }
+      const [prodText, statsText] = await Promise.all([
+        readText(productFile.uri),
+        readText(statsFile.uri),
+      ]);
+      const productRows = parseCsv(prodText) as ProductRow[];
+      const statsRows = parseCsv(statsText) as StatsRow[];
+      if (!statsRows.length) throw new Error('売上詳細CSVに行がありません。');
+
+      const dayRow = statsRows[0];
+
+      const total = firstByCandidates(dayRow, ['売上高（税込み）','売上高 (税込み)','売上高 (税込)','税込み売上高','税込売上']);
+      const cash  = firstByCandidates(dayRow, ['現金','cash','Cash','CASH']);
+      const card  = firstByCandidates(dayRow, ['Square']); // Squareのみ
+      const paypay= firstByCandidates(dayRow, ['PayPay','paypay']);
+      const funfo = firstByCandidates(dayRow, ['Funfo','fnfo','FNFO','Fnfo']);
+      const customers = firstByCandidates(dayRow, ['客数','来客数','会計数']);
+
+      const paymentIgnoreCands = [
+        '売上高（税込み）','売上高 (税込み)','売上高 (税込)','税込み売上高','税込売上',
+        '割引前 売上高','売上高（税抜き）','売上高（非課税）','内消費税（合計）',
+        '売上高（10%標準）','内消費税（10%標準）',
+        '売上高（8%軽減）','内消費税（8%軽減）',
+        '会計単価','客単価','商品販売数',
+        '現金','cash','Cash','CASH',
+        'Square','square',
+        'PayPay','paypay',
+        'Funfo','fnfo','FNFO','Fnfo',
+        '客数','来客数','会計数',
+        '集計期間',
+      ];
+      const ignorePaymentKeys = new Set(paymentIgnoreCands.map(norm));
+      const otherPayments: { label: string; amount: number }[] = [];
+      Object.entries(dayRow).forEach(([key, value]) => {
+        const amount = toNum(value);
+        if (!amount) return;
+        if (ignorePaymentKeys.has(norm(key))) return;
+        otherPayments.push({ label: String(key), amount });
+      });
+
+
+      const statsName = statsFile?.name ?? '';
+      const prodName  = productFile?.name ?? '';
+      const dateISOFromCol = String(dayRow['集計期間'] ?? '').match(/^\d{4}-\d{2}-\d{2}/)?.[0];
+      const dateISOFromStatsName = (()=> {
+        const m = String(statsName).match(/(20\d{2})年?0?(\d{1,2})月?0?(\d{1,2})日?/);
+        return m ? `${m[1]}-${String(m[2]).padStart(2,'0')}-${String(m[3]).padStart(2,'0')}` : undefined;
+      })();
+      const dateISOFromProdName = (()=> {
+        const m = String(prodName).replace(/\u00A0/g,' ').match(/(20\d{2})年?0?(\d{1,2})月?0?(\d{1,2})日?/);
+        return m ? `${m[1]}-${String(m[2]).padStart(2,'0')}-${String(m[3]).padStart(2,'0')}` : undefined;
+      })();
+      const dateISO = dateISOFromCol ?? dateISOFromStatsName ?? dateISOFromProdName ?? new Date().toISOString().slice(0,10);
+
+      const localTotals: Totals = makeEmptyTotals();
+      const localSetTotals: SetTotals = makeEmptySetTotals();
+      let yokubariCurry = 0;
+      let pattyCurry = 0;
+
+      const ambiguous: { name: string; count: number; isSet: boolean }[] = [];
+
+            for (const r of productRows) {
+        const name = firstKeyStr(r, PRODUCT_NAME_CANDS);
+        const cnt  = firstByCandidates(r, PRODUCT_QTY_CANDS);
+        if (!cnt) continue;
+
+        const category = firstKeyStr(r, PRODUCT_CATEGORY_CANDS);
+        const isCourseLike = /(予約メニュー|予約|コース|course)/i.test(category);
+
+        if (isYokubariCurry(name)) { yokubariCurry += cnt; continue; }
+        if (isPattyCurry(name)) { pattyCurry += cnt; continue; }
+
+        const isSetCandidate = /(セット|コース|set\b|course\b)/i.test(name) || isCourseLike;
+        const guessed = guessRamenKey(name);
+        if (guessed) {
+          if (isSetCandidate) {
+            localSetTotals[guessed] += cnt;
+          } else {
+            localTotals[guessed] += cnt;
+          }
+          continue;
+        }
+
+        if (!isRamenish(name)) continue;
+
+        const isSet = isSetCandidate;
+        ambiguous.push({ name, count: cnt, isSet });
+      }
+
+      setRamenTotals(localTotals);
+      setRamenSetTotals(localSetTotals);
+      setUnassigned(ambiguous);
+      setMeta({ dateISO, total, cash, card, paypay, funfo, customers, yokubariCurry, pattyCurry, otherPayments });
+    } catch (e: any) {
+      console.error(e);
+      Alert.alert('エラー', e?.message ?? String(e));
+    }
+  };
+
+  const assignAllUnassignedToHanaSet = () => {
+    if (!unassigned.length) {
+      Alert.alert('未振り分けなし', '振り分け候補の項目はありません。');
+      return;
+    }
+    const addCount = unassigned.reduce((s,it)=>s+it.count,0);
+    setRamenSetTotals(prev => ({ ...prev, 花: prev.花 + addCount }));
+    setUnassigned([]);
+  };
+
+  const applyAssign = (index: number, key: RamenKey, asSet: boolean, amount?: number) => {
+    setUnassigned(prev => {
+      const next = [...prev];
+      const item = next[index];
+      if (!item) return prev;
+      const requested = amount ?? item.count;
+      const numeric = typeof requested === 'number' && Number.isFinite(requested) ? Math.floor(requested) : item.count;
+      const qty = Math.max(0, Math.min(numeric, item.count));
+      if (qty <= 0) return prev;
+      if (asSet) {
+        setRamenSetTotals(prevTotals => ({ ...prevTotals, [key]: prevTotals[key] + qty }));
+      } else {
+        setRamenTotals(prevTotals => ({ ...prevTotals, [key]: prevTotals[key] + qty }));
+      }
+      if (qty >= item.count) {
+        next.splice(index, 1);
+      } else {
+        next[index] = { ...item, count: item.count - qty };
+      }
+      return next;
+    });
+  };
+
+  const onCopy = async () => {
+    if (!output) return;
+    await Clipboard.setString(output);
+    Alert.alert('コピー完了', '日報テキストをクリップボードにコピーしました。');
+  };
+
+  const onShare = async () => {
+    if (!output) return;
+    // まずテキスト共有（確実）
+    try {
+      await Share.share({ message: output });
+    } catch (e) {
+      Alert.alert('共有エラー', String(e));
+      return;
+    }
+    // 併せてアプリ内ドキュメントへ保存（必要に応じて拾えるように）
+    try {
+      const fileName = `summary_${meta.dateISO}.txt`;
+      const path = `${RNFS.DocumentDirectoryPath}/${fileName}`;
+      await RNFS.writeFile(path, output, 'utf8');
+    } catch {}
+  };
+
+  const fileBadge = (f: PickedFile|null, label: string) => (
+    <View style={styles.fileRow}>
+      <Text style={styles.fileLabel}>{label}</Text>
+      <Text style={styles.fileName}>{f?.name ?? '未選択'}</Text>
+    </View>
+  );
+
+  return (
+    <ScrollView contentContainerStyle={styles.container}>
+      <Text style={styles.h1}>CSVから日報テキスト生成</Text>
+
+      {fileBadge(productFile, '① 商品別 CSV')}
+      <View style={styles.row}>
+        <Pressable style={styles.btn} onPress={() => onPick('product')}>
+          <Text style={styles.btnText}>商品別CSVを選ぶ</Text>
+        </Pressable>
+      </View>
+
+      {fileBadge(statsFile, '② 支払方法別／拡張統計 CSV')}
+      <View style={styles.row}>
+        <Pressable style={styles.btn} onPress={() => onPick('stats')}>
+          <Text style={styles.btnText}>支払方法別CSVを選ぶ</Text>
+        </Pressable>
+      </View>
+
+      <View style={styles.row}>
+        <Pressable style={[styles.btn, styles.primary]} onPress={makeSummary}>
+          <Text style={[styles.btnText, styles.primaryText]}>解析して文章を作る</Text>
+        </Pressable>
+      </View>
+
+      {/* 日付手動調整（JST） */}
+      <View style={[styles.row, { justifyContent:'space-between', alignItems:'center' }]}>
+        <Pressable
+          style={[styles.btn, styles.outline, { minWidth:84, alignItems:'center' }]}
+          onPress={()=>{
+            const d = new Date(meta.dateISO+'T00:00:00+09:00'); d.setDate(d.getDate()-1);
+            setMeta(prev=>({ ...prev, dateISO: d.toISOString().slice(0,10) }));
+          }}>
+          <Text style={styles.btnText}>← 前日</Text>
+        </Pressable>
+        <Text style={{ fontSize:14, fontWeight:'600' }}>{jpDateLabel(meta.dateISO)}</Text>
+        <Pressable
+          style={[styles.btn, styles.outline, { minWidth:84, alignItems:'center' }]}
+          onPress={()=>{
+            const d = new Date(meta.dateISO+'T00:00:00+09:00'); d.setDate(d.getDate()+1);
+            setMeta(prev=>({ ...prev, dateISO: d.toISOString().slice(0,10) }));
+          }}>
+          <Text style={styles.btnText}>翌日 →</Text>
+        </Pressable>
+      </View>
+
+      <Text style={styles.h2}>出力プレビュー</Text>
+      <View style={styles.outputBox}>
+        <Text style={styles.mono}>{output || '（ここに生成された文章が表示されます）'}</Text>
+      </View>
+
+      <View style={styles.toolbar}>
+        <Pressable style={styles.btn} onPress={onCopy} disabled={!output}>
+          <Text style={styles.btnText}>コピー</Text>
+        </Pressable>
+        <Pressable style={styles.btn} onPress={onShare} disabled={!output}>
+          <Text style={styles.btnText}>テキスト保存/共有</Text>
+        </Pressable>
+      </View>
+
+      {!!unassigned.length && (
+        <View style={styles.unassignedBox}>
+          <Text style={styles.warnTitle}>要振り分け候補（未計上）: {unassigned.length}件</Text>
+          {unassigned.map((a,i)=>(
+            <View key={`${a.name}-${i}`} style={styles.unassignedItem}>
+              <View style={{ flexDirection:'row', alignItems:'center', flexWrap:'wrap' }}>
+                <Text style={styles.itemName}>・{a.name}</Text>
+                <Text style={styles.itemMeta}>× {a.count}{a.isSet ? '（セット由来）' : ''}</Text>
+              </View>
+              <Text style={{ marginTop:6, fontSize:12 }}>通常に追加（残り {a.count}）</Text>
+              <View style={styles.chipRow}>
+                {RAMEN_DISPLAY_ORDER.map(k => (
+                  <Pressable
+                    key={`base-${k}`}
+                    style={styles.chip}
+                    onPress={() => applyAssign(i, k, false, 1)}
+                    onLongPress={() => applyAssign(i, k, false, a.count)}
+                    delayLongPress={200}
+                  >
+                    <Text style={styles.chipText}>＋{RAMEN_LABELS[k]}</Text>
+                  </Pressable>
+                ))}
+              </View>
+              {!!SET_ALLOWED_KEYS.length && (
+                <>
+                  <Text style={{ marginTop:8, fontSize:12 }}>セットに追加</Text>
+                  <View style={styles.chipRow}>
+                    {SET_ALLOWED_KEYS.map(k => (
+                      <Pressable
+                        key={`set-${k}`}
+                        style={[styles.chip, styles.chipSet]}
+                        onPress={() => applyAssign(i, k, true, 1)}
+                        onLongPress={() => applyAssign(i, k, true, a.count)}
+                        delayLongPress={200}
+                      >
+                        <Text style={styles.chipText}>＋{RAMEN_LABELS[k]}（セット）</Text>
+                      </Pressable>
+                    ))}
+                  </View>
+                </>
+              )}
+            </View>
+          ))}
+          <Pressable style={[styles.btn, styles.outline, { marginTop:12 }]} onPress={assignAllUnassignedToHanaSet}>
+            <Text style={styles.btnText}>未振り分けを一括で「花セット」計上</Text>
+          </Pressable>
+          <Text style={styles.warnNote}>※ボタンをタップで1杯ずつ、長押しで残数をまとめて配分できます。</Text>
+        </View>
+      )}
+
+      <View style={{ height: 32 }} />
+    </ScrollView>
+  );
+}
+
+const styles = StyleSheet.create({
+  container: { padding: 16, gap: 12 },
+  h1: { fontSize: 18, fontWeight: '700' },
+  h2: { fontSize: 16, fontWeight: '600', marginTop: 8 },
+  row: { flexDirection: 'row', gap: 8, alignItems: 'center' },
+  btn: { paddingVertical: 10, paddingHorizontal: 14, borderRadius: 10, backgroundColor: '#f2f2f7' },
+  btnText: { fontSize: 14, fontWeight: '600', color: '#111' },
+  primary: { backgroundColor: '#007aff' },
+  primaryText: { color: '#fff' },
+  outline: { backgroundColor: '#fff', borderWidth: 1, borderColor: '#c7c7cc' },
+  fileRow: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center' },
+  fileLabel: { fontSize: 14, color: '#444' },
+  fileName: { fontSize: 14, fontWeight: '600' },
+  outputBox: {
+    padding: 12, backgroundColor: '#fbfbfd', borderRadius: 10,
+    borderWidth: StyleSheet.hairlineWidth, borderColor: '#e5e5ea', minHeight: 160,
+  },
+  mono: {
+    fontFamily: Platform.select({ ios: 'Menlo', android: 'monospace', default: 'Courier' }),
+    fontSize: 14, lineHeight: 20,
+  },
+  toolbar: { flexDirection: 'row', gap: 12 },
+  unassignedBox: {
+    marginTop: 8, padding: 12, borderRadius: 10, borderWidth: StyleSheet.hairlineWidth,
+    borderColor: '#ffd60a', backgroundColor: '#fffbea',
+  },
+  unassignedItem: { marginTop: 8 },
+  itemName: { fontSize: 13, fontWeight: '600' },
+  itemMeta: { fontSize: 12, color: '#666', marginLeft: 6 },
+  chipRow: { flexDirection: 'row', flexWrap: 'wrap', gap: 8, marginTop: 6 },
+  chip: { paddingVertical: 6, paddingHorizontal: 10, borderRadius: 999, backgroundColor: '#f2f2f7' },
+  chipSet: { backgroundColor: '#e7f0ff' },
+  chipText: { fontSize: 12, fontWeight: '600' },
+  warnTitle: { fontWeight: '700', marginBottom: 6 },
+  warnNote: { fontSize: 12, color: '#666', marginTop: 6 },
+});

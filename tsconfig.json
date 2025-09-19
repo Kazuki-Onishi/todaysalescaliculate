@@ -1,0 +1,8 @@
+﻿{
+  "extends": "@react-native/typescript-config/tsconfig.json",
+  "compilerOptions": {
+    "jsx": "react-jsx",
+    "types": ["react-native", "jest", "vite/client"]
+  },
+  "include": ["src"]
+}
