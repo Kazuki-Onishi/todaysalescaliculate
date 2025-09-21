@@ -16,6 +16,7 @@ import RNFS from 'react-native-fs';
 import BlobUtil from 'react-native-blob-util';
 import Clipboard from '@react-native-clipboard/clipboard';
 import Papa from 'papaparse';
+import * as XLSX from 'xlsx';
 
 type ProductRow = Record<string, any>;
 type StatsRow = Record<string, any>;
@@ -39,7 +40,7 @@ const SET_ALLOWED_KEYS: ReadonlyArray<RamenKey> = ['花', '月花', '雪月'];
 type Totals = Record<RamenKey, number>;
 type SetTotals = Record<RamenKey, number>;
 
-type PickedFile = { uri: string; name?: string };
+type PickedFile = { uri: string; name?: string; type?: string | null };
 type OtherPayment = { label: string; amount: number };
 type CoursePeopleEntry = { label: string; price: number; count: number };
 type UnassignedItem = { name: string; count: number };
@@ -258,12 +259,12 @@ const renderOutput = (
 async function pickOne(_kind: 'product' | 'stats'): Promise<PickedFile | null> {
   try {
     const res = await DocumentPicker.pickSingle({
-      type: [DocTypes.csv, DocTypes.plainText, 'text/comma-separated-values', 'application/vnd.ms-excel'],
+      type: [DocTypes.csv, DocTypes.plainText, 'text/comma-separated-values', 'application/vnd.ms-excel', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'],
       copyTo: 'cachesDirectory',
       presentationStyle: 'fullScreen',
     });
     const uri = res.fileCopyUri || res.uri;
-    return { uri, name: res.name || (res as any).fileName || 'selected.csv' };
+    return { uri, name: res.name || (res as any).fileName || 'selected.csv', type: res.type ?? (res as any).type ?? null };
   } catch (e: any) {
     if (DocumentPicker.isCancel(e)) return null;
     console.error(e);
@@ -283,6 +284,41 @@ async function readText(uri: string): Promise<string> {
   }
   const path = uri.startsWith('file://') ? uri.replace('file://', '') : uri;
   return await RNFS.readFile(path, 'utf8');
+}
+
+const EXCEL_MIME_TYPES = new Set([
+  'application/vnd.ms-excel',
+  'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+]);
+
+const isExcelFile = (file: PickedFile) => {
+  const name = file.name?.toLowerCase() ?? '';
+  const mime = file.type?.toLowerCase() ?? '';
+  if (/\.(xlsx|xls)$/i.test(name)) return true;
+  if (!mime) return false;
+  if (EXCEL_MIME_TYPES.has(mime)) return true;
+  return mime.includes('spreadsheetml');
+};
+
+async function readExcelRows(file: PickedFile): Promise<Record<string, any>[]> {
+  let workbook: XLSX.WorkBook;
+  if (Platform.OS === 'web') {
+    const response = await fetch(file.uri);
+    if (!response.ok) throw new Error('Excel/CSVの読み込みに失敗（web）');
+    const arrayBuffer = await response.arrayBuffer();
+    workbook = XLSX.read(arrayBuffer, { type: 'array' });
+  } else if (file.uri.startsWith('content://')) {
+    const base64 = await BlobUtil.fs.readFile(file.uri, 'base64');
+    workbook = XLSX.read(base64, { type: 'base64' });
+  } else {
+    const path = file.uri.startsWith('file://') ? file.uri.replace('file://', '') : file.uri;
+    const base64 = await RNFS.readFile(path, 'base64');
+    workbook = XLSX.read(base64, { type: 'base64' });
+  }
+  const sheetName = workbook.SheetNames?.[0];
+  if (!sheetName) return [];
+  const sheet = workbook.Sheets[sheetName];
+  return XLSX.utils.sheet_to_json(sheet, { defval: '' });
 }
 
 export default function TestPageScreen() {
@@ -328,15 +364,26 @@ export default function TestPageScreen() {
     return data as any[];
   };
 
+  const readRows = async (file: PickedFile) => {
+    if (isExcelFile(file)) {
+      return await readExcelRows(file);
+    }
+    const text = await readText(file.uri);
+    return parseCsv(text);
+  };
+
   const makeSummary = async () => {
     try {
       if (!productFile || !statsFile) {
-        Alert.alert('不足', '「商品別CSV」と「支払方法別CSV」を両方選んでください。');
+        Alert.alert('不足', '「商品別 CSV/Excel」と「支払方法別 CSV/Excel」を両方選んでください。');
         return;
       }
-      const [prodText, statsText] = await Promise.all([readText(productFile.uri), readText(statsFile.uri)]);
-      const productRows = parseCsv(prodText) as ProductRow[];
-      const statsRows = parseCsv(statsText) as StatsRow[];
+      const [productRowsRaw, statsRowsRaw] = await Promise.all([
+        readRows(productFile),
+        readRows(statsFile),
+      ]);
+      const productRows = productRowsRaw as ProductRow[];
+      const statsRows = statsRowsRaw as StatsRow[];
       if (!statsRows.length) throw new Error('売上詳細CSVに行がありません。');
 
       const dayRow = statsRows[0];
@@ -568,19 +615,19 @@ export default function TestPageScreen() {
 
   return (
     <ScrollView contentContainerStyle={styles.container}>
-      <Text style={styles.h1}>CSVから日報テキスト生成</Text>
+      <Text style={styles.h1}>CSV/Excelから日報テキスト生成</Text>
 
-      {fileBadge(productFile, '① 商品別 CSV')}
+      {fileBadge(productFile, '① 商品別 CSV/Excel')}
       <View style={styles.row}>
         <Pressable style={styles.btn} onPress={() => onPick('product')}>
-          <Text style={styles.btnText}>商品別CSVを選ぶ</Text>
+          <Text style={styles.btnText}>商品別CSV/Excelを選ぶ</Text>
         </Pressable>
       </View>
 
-      {fileBadge(statsFile, '② 支払方法別／拡張統計 CSV')}
+      {fileBadge(statsFile, '② 支払方法別／拡張統計 CSV/Excel')}
       <View style={styles.row}>
         <Pressable style={styles.btn} onPress={() => onPick('stats')}>
-          <Text style={styles.btnText}>支払方法別CSVを選ぶ</Text>
+          <Text style={styles.btnText}>支払方法別CSV/Excelを選ぶ</Text>
         </Pressable>
       </View>
 
